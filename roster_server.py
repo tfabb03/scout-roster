@@ -22,7 +22,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
-import re, logging, time, brotli
+import re, logging, time
 from functools import lru_cache
 
 app = Flask(__name__)
@@ -64,7 +64,7 @@ SESSION.headers.update(BROWSER_HEADERS)
 
 
 def fetch(url, timeout=15):
-    """Fetch a URL, rotating User-Agent on retry. Handles brotli compression."""
+    """Fetch a URL, rotating User-Agent on retry. Returns (BeautifulSoup, raw_text) or raises."""
     last_err = None
     for ua in random.sample(USER_AGENTS, len(USER_AGENTS)):
         try:
@@ -76,28 +76,14 @@ def fetch(url, timeout=15):
                 SESSION.get(base, timeout=6, allow_redirects=True)
             except Exception:
                 pass
-            # Don't let requests auto-decode — we handle it ourselves for brotli
-            r = SESSION.get(url, timeout=timeout, allow_redirects=True, stream=False)
+            r = SESSION.get(url, timeout=timeout, allow_redirects=True)
             if r.status_code == 403:
                 body = r.text.strip()
                 last_err = f"403 from {url} — {body[:80]}"
                 log.warning(last_err)
                 continue  # try next UA
             r.raise_for_status()
-
-            # Handle brotli manually (requests doesn't decode br by default)
-            encoding = r.headers.get("Content-Encoding", "").lower()
-            if encoding == "br":
-                try:
-                    raw_text = brotli.decompress(r.content).decode("utf-8", errors="replace")
-                except Exception as e:
-                    log.warning(f"Brotli decompress failed: {e}, falling back to r.text")
-                    raw_text = r.text
-            else:
-                raw_text = r.text
-
-            return BeautifulSoup(raw_text, "lxml"), raw_text
-
+            return BeautifulSoup(r.text, "lxml"), r.text
         except requests.HTTPError as e:
             last_err = str(e)
             continue
@@ -138,71 +124,224 @@ def parse_stat(raw):
 # Sidearm powers ~65% of NCAA D1 and most D2/D3/NJCAA/NAIA sites.
 # Their roster page HTML is consistent across versions.
 # ---------------------------------------------------------------------------
+def extract_player_from_element(el, base_url):
+    """Extract player dict from any Sidearm element (card, row, li)."""
+    # Jersey number
+    num = ""
+    for sel in [".s-person-card__content__jersey", ".roster_jersey", "[class*='jersey']",
+                "td:first-child", ".jersey"]:
+        el2 = el.select_one(sel)
+        if el2:
+            num = clean(el2.get_text())
+            if re.match(r"^\d{1,2}$", num.lstrip("0") or "0"):
+                break
+            num = ""
+
+    # Name
+    name = ""
+    for sel in [
+        ".s-person-details__personal-single-line-name",
+        ".s-person__name", ".full-name", ".roster_name",
+        "[class*='full-name']", "[class*='roster_name']",
+        "a[href*='/roster/']", "a[href*='/athlete']",
+        "td.name", ".name a", ".name",
+    ]:
+        el2 = el.select_one(sel)
+        if el2:
+            candidate = clean(el2.get_text())
+            if candidate and len(candidate) > 2 and not candidate.isdigit():
+                name = candidate
+                break
+
+    if not name:
+        # fallback: second <td> often has name in table layouts
+        tds = el.find_all("td")
+        if len(tds) >= 2:
+            candidate = clean(tds[1].get_text())
+            if candidate and len(candidate) > 2:
+                name = candidate
+
+    # Position
+    pos = ""
+    for sel in [".s-person-details__personal-item--position",
+                ".roster_pos", "[class*='position']", "td.pos",
+                "[class*='roster_pos']"]:
+        el2 = el.select_one(sel)
+        if el2:
+            pos = clean(el2.get_text())
+            break
+
+    # Height
+    ht = ""
+    for sel in [".s-person-details__personal-item--height",
+                ".roster_ht", "[class*='height']", "td.ht",
+                "[class*='roster_ht']"]:
+        el2 = el.select_one(sel)
+        if el2:
+            ht = parse_height(el2.get_text())
+            break
+
+    # Year / Class
+    yr = ""
+    for sel in [".s-person-details__personal-item--academic-year",
+                ".roster_yr", "[class*='year']", "[class*='academic']",
+                "td.yr", "td.class", "[class*='roster_yr']"]:
+        el2 = el.select_one(sel)
+        if el2:
+            candidate = clean(el2.get_text())
+            if candidate and len(candidate) <= 20:
+                yr = candidate
+                break
+
+    # Hometown
+    hometown = ""
+    for sel in [".roster_hometown", "[class*='hometown']", "[class*='city']",
+                "td.hometown", "[class*='roster_hometown']"]:
+        el2 = el.select_one(sel)
+        if el2:
+            hometown = clean(el2.get_text())
+            break
+
+    # Photo
+    photo_url = ""
+    for sel in ["img.s-person-card__header__image", "img[class*='roster']",
+                "img[class*='headshot']", "img[class*='player']", "img"]:
+        img = el.select_one(sel)
+        if img:
+            src = img.get("data-src") or img.get("src", "")
+            if src and "silhouette" not in src and "placeholder" not in src and "spacer" not in src:
+                photo_url = src if src.startswith("http") else base_url.rstrip("/") + src
+            break
+
+    return {"num": num, "name": name, "pos": pos, "ht": ht, "yr": yr,
+            "hometown": hometown, "photo_url": photo_url, "stats": {}}
+
+
 def scrape_sidearm(soup, base_url):
+    """
+    Comprehensive Sidearm scraper covering v1 (legacy table), v2 (2019-2022),
+    and v3 (2022+ card layout). Tries selectors in order until players found.
+    """
     players = []
 
-    # -- Version 3 (2022+): .s-person-card blocks --
+    # ── v3: .s-person-card ──────────────────────────────────────────────
     cards = soup.select(".s-person-card")
     if cards:
         for card in cards:
-            num_el  = card.select_one(".s-person-card__content__jersey, [class*='jersey']")
-            name_el = card.select_one(".s-person-details__personal-single-line-name, .s-person__name, [class*='full-name']")
-            pos_el  = card.select_one("[class*='position'], .s-person-details__personal-item--position")
-            ht_el   = card.select_one("[class*='height'], .s-person-details__personal-item--height")
-            yr_el   = card.select_one("[class*='academic'], [class*='year'], .s-person-details__personal-item--academic-year")
-            city_el = card.select_one("[class*='hometown'], [class*='city']")
-            photo_el= card.select_one("img.s-person-card__header__image, img[class*='roster']")
-
-            photo_url = ""
-            if photo_el:
-                src = photo_el.get("data-src") or photo_el.get("src", "")
-                if src and not src.endswith("silhouette") and "placeholder" not in src:
-                    photo_url = src if src.startswith("http") else base_url.rstrip("/") + src
-
-            p = {
-                "num":       clean(num_el.get_text() if num_el else ""),
-                "name":      clean(name_el.get_text() if name_el else ""),
-                "pos":       clean(pos_el.get_text() if pos_el else ""),
-                "ht":        parse_height(ht_el.get_text() if ht_el else ""),
-                "yr":        clean(yr_el.get_text() if yr_el else ""),
-                "hometown":  clean(city_el.get_text() if city_el else ""),
-                "photo_url": photo_url,
-                "stats":     {},
-            }
+            p = extract_player_from_element(card, base_url)
             if p["name"]:
                 players.append(p)
         if players:
+            log.info(f"Sidearm v3 cards: {len(players)} players")
             return players
 
-    # -- Version 2 (2018-2022): table-based or .roster_name --
-    rows = soup.select("tr.roster-row, tr[class*='roster'], .roster_player, [class*='roster-player']")
-    if not rows:
-        # generic table rows with player data
-        rows = soup.select("table.roster tbody tr, table[class*='roster'] tbody tr")
+    # ── v2: <ul> roster list ────────────────────────────────────────────
+    items = soup.select("ul.roster-list li, ul[class*='roster'] li")
+    if items:
+        for item in items:
+            p = extract_player_from_element(item, base_url)
+            if p["name"]:
+                players.append(p)
+        if players:
+            log.info(f"Sidearm v2 ul-li: {len(players)} players")
+            return players
 
-    for row in rows:
-        tds = row.find_all("td")
-        if len(tds) < 3:
+    # ── v2: table rows with class rosterItem / odd / even ───────────────
+    for row_sel in ["tr.rosterItem", "tr.odd, tr.even", "tr[class*='rosterItem']",
+                    ".roster_item", "[class*='roster-item']"]:
+        rows = soup.select(row_sel)
+        if len(rows) >= 3:  # need at least a few rows to be a real roster
+            for row in rows:
+                p = extract_player_from_element(row, base_url)
+                if p["name"] and len(p["name"]) > 2:
+                    players.append(p)
+            if players:
+                log.info(f"Sidearm v2 row selector '{row_sel}': {len(players)} players")
+                return players
+
+    # ── v2/legacy: biggest table that looks like a roster ───────────────
+    tables = soup.find_all("table")
+    for table in sorted(tables, key=lambda t: len(t.find_all("tr")), reverse=True):
+        text = table.get_text(" ").lower()
+        # score how roster-like this table is
+        score = (
+            text.count("guard") * 3 + text.count("forward") * 3 +
+            text.count("center") * 3 +
+            len(re.findall(r"\b\d-\d{1,2}\b", text)) * 2 +
+            text.count(" fr") + text.count(" so") + text.count(" jr") + text.count(" sr")
+        )
+        if score < 3:
             continue
-        num_el  = row.select_one(".roster_jersey, td.jersey, [class*='jersey']")
-        name_el = row.select_one(".roster_name, a[href*='player'], a[href*='athlete']")
-        pos_el  = row.select_one(".roster_pos, td.pos, [class*='pos']")
-        ht_el   = row.select_one(".roster_ht, td.ht, [class*='height']")
-        yr_el   = row.select_one(".roster_yr, td.yr, [class*='year'], [class*='class']")
-        city_el = row.select_one(".roster_hometown, [class*='hometown']")
 
-        p = {
-            "num":       clean(num_el.get_text() if num_el else (tds[0].get_text() if tds else "")),
-            "name":      clean(name_el.get_text() if name_el else (tds[1].get_text() if len(tds)>1 else "")),
-            "pos":       clean(pos_el.get_text() if pos_el else ""),
-            "ht":        parse_height(ht_el.get_text() if ht_el else ""),
-            "yr":        clean(yr_el.get_text() if yr_el else ""),
-            "hometown":  clean(city_el.get_text() if city_el else ""),
-            "photo_url": "",
-            "stats":     {},
-        }
-        if p["name"] and len(p["name"]) > 2:
+        rows = table.find_all("tr")
+        if len(rows) < 3:
+            continue
+
+        # detect header
+        header_row = rows[0]
+        headers = [clean(th.get_text()).lower() for th in header_row.find_all(["th", "td"])]
+
+        col = {}
+        for i, h in enumerate(headers):
+            if any(x in h for x in ["no", "#", "num", "jersey"]):  col.setdefault("num", i)
+            elif any(x in h for x in ["name", "player", "athlete"]): col.setdefault("name", i)
+            elif h in ("pos", "position"):                             col.setdefault("pos", i)
+            elif any(x in h for x in ["ht", "height"]):               col.setdefault("ht", i)
+            elif any(x in h for x in ["yr", "year", "cl", "class"]):  col.setdefault("yr", i)
+            elif any(x in h for x in ["hometown", "city", "from"]):   col.setdefault("hometown", i)
+
+        def cell(tds, key, fallback_idx=None):
+            idx = col.get(key, fallback_idx)
+            return clean(tds[idx].get_text()) if idx is not None and idx < len(tds) else ""
+
+        for row in rows[1:]:
+            tds = row.find_all(["td", "th"])
+            if len(tds) < 2:
+                continue
+            name = cell(tds, "name", 1)
+            # skip header-like repeats
+            if not name or len(name) < 3 or name.lower() in ("name", "player", "athlete"):
+                continue
+            # skip rows that are section headers (single merged cell)
+            if len(tds) == 1:
+                continue
+
+            # photo from img in row
+            photo_url = ""
+            img = row.select_one("img")
+            if img:
+                src = img.get("data-src") or img.get("src", "")
+                if src and "silhouette" not in src and "placeholder" not in src:
+                    photo_url = src if src.startswith("http") else base_url.rstrip("/") + src
+
+            p = {
+                "num":      cell(tds, "num", 0),
+                "name":     name,
+                "pos":      cell(tds, "pos"),
+                "ht":       parse_height(cell(tds, "ht")),
+                "yr":       cell(tds, "yr"),
+                "hometown": cell(tds, "hometown"),
+                "photo_url": photo_url,
+                "stats":    {},
+            }
             players.append(p)
+
+        if players:
+            log.info(f"Sidearm table scrape: {len(players)} players")
+            return players
+
+    # ── last resort: any link to a player profile page ──────────────────
+    profile_links = soup.select("a[href*='/sports/mens-basketball/roster/'],"
+                                "a[href*='/sports/womens-basketball/roster/']")
+    seen = set()
+    for a in profile_links:
+        name = clean(a.get_text())
+        if name and len(name) > 2 and name not in seen:
+            seen.add(name)
+            players.append({"num": "", "name": name, "pos": "", "ht": "",
+                            "yr": "", "hometown": "", "photo_url": "", "stats": {}})
+    if players:
+        log.info(f"Sidearm profile links fallback: {len(players)} players")
 
     return players
 
