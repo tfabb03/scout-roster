@@ -43,17 +43,53 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
 }
+
+# Rotate through several realistic UAs to avoid single-UA blocks
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+import random
 
 SESSION = requests.Session()
 SESSION.headers.update(BROWSER_HEADERS)
 
 
 def fetch(url, timeout=15):
-    """Fetch a URL, return (BeautifulSoup, raw_text) or raise."""
-    r = SESSION.get(url, timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
-    return BeautifulSoup(r.text, "lxml"), r.text
+    """Fetch a URL, rotating User-Agent on retry. Returns (BeautifulSoup, raw_text) or raises."""
+    last_err = None
+    for ua in random.sample(USER_AGENTS, len(USER_AGENTS)):
+        try:
+            SESSION.headers["User-Agent"] = ua
+            # Hit the base domain first to pick up cookies (helps with Sidearm WAF)
+            from urllib.parse import urlparse
+            base = f"{urlparse(url).scheme}://{urlparse(url).netloc}/"
+            try:
+                SESSION.get(base, timeout=6, allow_redirects=True)
+            except Exception:
+                pass
+            r = SESSION.get(url, timeout=timeout, allow_redirects=True)
+            if r.status_code == 403:
+                body = r.text.strip()
+                last_err = f"403 from {url} — {body[:80]}"
+                log.warning(last_err)
+                continue  # try next UA
+            r.raise_for_status()
+            return BeautifulSoup(r.text, "lxml"), r.text
+        except requests.HTTPError as e:
+            last_err = str(e)
+            continue
+        except Exception as e:
+            raise
+    raise requests.HTTPError(last_err or f"All UAs blocked for {url}")
 
 
 # ---------------------------------------------------------------------------
@@ -440,8 +476,12 @@ def get_roster():
                 source = "espn"
 
         except requests.HTTPError as e:
-            log.warning(f"HTTP error {e} for {roster_url}")
-            # fall through to ESPN
+            err_str = str(e)
+            log.warning(f"HTTP error for {roster_url}: {err_str}")
+            if "403" in err_str:
+                # Site is blocking the server IP — fall through to ESPN
+                log.info(f"Site blocked server IP, trying ESPN for {school}")
+            # fall through to ESPN below
         except Exception as e:
             log.error(f"Scrape error: {e}")
             return jsonify({"error": str(e), "players": []}), 500
@@ -473,6 +513,35 @@ def get_roster():
 @app.route("/api/health")
 def health():
     return jsonify({"status": "ok", "ts": int(time.time())})
+
+
+@app.route("/api/debug")
+def debug():
+    """
+    Test endpoint: fetches a URL and returns what the server sees.
+    Usage: /api/debug?url=https://marywoodpacers.com/sports/mens-basketball/roster
+    Helps diagnose whether Railway's IP is blocked by the target site.
+    """
+    url = request.args.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "url param required"}), 400
+    try:
+        r = SESSION.get(url, timeout=15, allow_redirects=True)
+        soup = BeautifulSoup(r.text, "lxml")
+        cms = detect_cms(soup, url)
+        sidearm_cards = len(soup.select(".s-person-card"))
+        tables = len(soup.find_all("table"))
+        return jsonify({
+            "status_code": r.status_code,
+            "content_length": len(r.text),
+            "cms_detected": cms,
+            "sidearm_cards": sidearm_cards,
+            "tables": tables,
+            "first_500_chars": r.text[:500],
+            "response_headers": dict(r.headers),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "url": url}), 500
 
 
 if __name__ == "__main__":
