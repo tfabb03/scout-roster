@@ -261,66 +261,95 @@ def scrape_sidearm(soup, base_url):
 
     # ── v2/legacy: biggest table that looks like a roster ───────────────
     tables = soup.find_all("table")
-    for table in sorted(tables, key=lambda t: len(t.find_all("tr")), reverse=True):
-        text = table.get_text(" ").lower()
-        # score how roster-like this table is
-        score = (
-            text.count("guard") * 3 + text.count("forward") * 3 +
-            text.count("center") * 3 +
-            len(re.findall(r"\b\d-\d{1,2}\b", text)) * 2 +
-            text.count(" fr") + text.count(" so") + text.count(" jr") + text.count(" sr")
-        )
-        if score < 3:
-            continue
 
-        rows = table.find_all("tr")
+    # Score each table — heavily weight having real roster column headers
+    def score_table(t):
+        text = t.get_text(" ").lower()
+        rows = t.find_all("tr")
         if len(rows) < 3:
-            continue
+            return 0
+        header_text = " ".join(clean(c.get_text()).lower() for c in rows[0].find_all(["th","td"]))
+        score = (
+            # strong signals in the header
+            ("full name" in header_text or "player" in header_text or "athlete" in header_text) * 10 +
+            ("pos" in header_text or "position" in header_text) * 5 +
+            ("ht" in header_text or "height" in header_text) * 5 +
+            ("cl." in header_text or "yr" in header_text or "class" in header_text) * 4 +
+            ("hometown" in header_text or "high school" in header_text) * 3 +
+            # body signals
+            text.count("guard") * 3 + text.count("forward") * 3 + text.count("center") * 3 +
+            len(re.findall(r"\b\d-\d{1,2}\b", text)) * 2 +
+            # row count bonus (real rosters have 10-20 players)
+            min(len(rows), 25)
+        )
+        return score
 
-        # detect header
+    best_table = max(tables, key=score_table, default=None)
+    if best_table and score_table(best_table) > 5:
+        rows = best_table.find_all("tr")
         header_row = rows[0]
         headers = [clean(th.get_text()).lower() for th in header_row.find_all(["th", "td"])]
 
         col = {}
         for i, h in enumerate(headers):
-            if any(x in h for x in ["no", "#", "num", "jersey"]):  col.setdefault("num", i)
-            elif any(x in h for x in ["name", "player", "athlete"]): col.setdefault("name", i)
-            elif h in ("pos", "position"):                             col.setdefault("pos", i)
-            elif any(x in h for x in ["ht", "height"]):               col.setdefault("ht", i)
-            elif any(x in h for x in ["yr", "year", "cl", "class"]):  col.setdefault("yr", i)
-            elif any(x in h for x in ["hometown", "city", "from"]):   col.setdefault("hometown", i)
+            if any(x in h for x in ["#", "no", "num", "jersey"]) and "full" not in h:
+                col.setdefault("num", i)
+            elif any(x in h for x in ["full name", "name", "player", "athlete"]):
+                col.setdefault("name", i)
+            elif h in ("pos.", "pos", "position"):
+                col.setdefault("pos", i)
+            elif h in ("ht.", "ht", "height"):
+                col.setdefault("ht", i)
+            elif any(x in h for x in ["cl.", "yr", "year", "class", "eligibility"]):
+                col.setdefault("yr", i)
+            elif any(x in h for x in ["hometown", "city", "high school", "from"]):
+                col.setdefault("hometown", i)
 
         def cell(tds, key, fallback_idx=None):
             idx = col.get(key, fallback_idx)
             return clean(tds[idx].get_text()) if idx is not None and idx < len(tds) else ""
+
+        JUNK_NAMES = {"full bio", "bio", "name", "player", "athlete", "view bio", "profile"}
 
         for row in rows[1:]:
             tds = row.find_all(["td", "th"])
             if len(tds) < 2:
                 continue
             name = cell(tds, "name", 1)
-            # skip header-like repeats
-            if not name or len(name) < 3 or name.lower() in ("name", "player", "athlete"):
+            if not name or len(name) < 3 or name.lower() in JUNK_NAMES:
                 continue
-            # skip rows that are section headers (single merged cell)
-            if len(tds) == 1:
+            # skip rows that are section dividers (all cells empty except one)
+            non_empty = sum(1 for td in tds if td.get_text(strip=True))
+            if non_empty < 2:
                 continue
 
-            # photo from img in row
+            # pos: take only the first word/token to avoid "Guard G 6'2"" bleed
+            pos_raw = cell(tds, "pos")
+            pos = pos_raw.split()[0] if pos_raw else ""
+            # normalize common expansions
+            pos_map = {"guard": "G", "forward": "F", "center": "C",
+                       "g": "G", "f": "F", "c": "C"}
+            pos = pos_map.get(pos.lower(), pos)
+
+            # hometown: take only content up to " / " if present (drop major/school bleed)
+            hometown_raw = cell(tds, "hometown")
+            hometown = hometown_raw.split(" / ")[0].strip() if hometown_raw else ""
+
+            # photo
             photo_url = ""
             img = row.select_one("img")
             if img:
                 src = img.get("data-src") or img.get("src", "")
-                if src and "silhouette" not in src and "placeholder" not in src:
+                if src and "silhouette" not in src and "placeholder" not in src and "spacer" not in src:
                     photo_url = src if src.startswith("http") else base_url.rstrip("/") + src
 
             p = {
-                "num":      cell(tds, "num", 0),
+                "num":      re.sub(r"\D", "", cell(tds, "num", 0)) or cell(tds, "num", 0),
                 "name":     name,
-                "pos":      cell(tds, "pos"),
+                "pos":      pos,
                 "ht":       parse_height(cell(tds, "ht")),
                 "yr":       cell(tds, "yr"),
-                "hometown": cell(tds, "hometown"),
+                "hometown": hometown,
                 "photo_url": photo_url,
                 "stats":    {},
             }
