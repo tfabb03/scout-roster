@@ -583,3 +583,6 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5050, debug=False)
+
+from email_sender import register_email_routes
+register_email_routes(app)
