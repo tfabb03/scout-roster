@@ -22,7 +22,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
-import re, logging, time
+import re, logging, time, brotli
 from functools import lru_cache
 
 app = Flask(__name__)
@@ -64,7 +64,7 @@ SESSION.headers.update(BROWSER_HEADERS)
 
 
 def fetch(url, timeout=15):
-    """Fetch a URL, rotating User-Agent on retry. Returns (BeautifulSoup, raw_text) or raises."""
+    """Fetch a URL, rotating User-Agent on retry. Handles brotli compression."""
     last_err = None
     for ua in random.sample(USER_AGENTS, len(USER_AGENTS)):
         try:
@@ -76,14 +76,28 @@ def fetch(url, timeout=15):
                 SESSION.get(base, timeout=6, allow_redirects=True)
             except Exception:
                 pass
-            r = SESSION.get(url, timeout=timeout, allow_redirects=True)
+            # Don't let requests auto-decode — we handle it ourselves for brotli
+            r = SESSION.get(url, timeout=timeout, allow_redirects=True, stream=False)
             if r.status_code == 403:
                 body = r.text.strip()
                 last_err = f"403 from {url} — {body[:80]}"
                 log.warning(last_err)
                 continue  # try next UA
             r.raise_for_status()
-            return BeautifulSoup(r.text, "lxml"), r.text
+
+            # Handle brotli manually (requests doesn't decode br by default)
+            encoding = r.headers.get("Content-Encoding", "").lower()
+            if encoding == "br":
+                try:
+                    raw_text = brotli.decompress(r.content).decode("utf-8", errors="replace")
+                except Exception as e:
+                    log.warning(f"Brotli decompress failed: {e}, falling back to r.text")
+                    raw_text = r.text
+            else:
+                raw_text = r.text
+
+            return BeautifulSoup(raw_text, "lxml"), raw_text
+
         except requests.HTTPError as e:
             last_err = str(e)
             continue
