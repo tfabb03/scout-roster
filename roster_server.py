@@ -671,27 +671,62 @@ def health():
 @app.route("/api/debug")
 def debug():
     """
-    Test endpoint: fetches a URL and returns what the server sees.
+    Full diagnostic endpoint. Runs every scraper strategy and reports results.
     Usage: /api/debug?url=https://marywoodpacers.com/sports/mens-basketball/roster
-    Helps diagnose whether Railway's IP is blocked by the target site.
     """
     url = request.args.get("url", "").strip()
     if not url:
         return jsonify({"error": "url param required"}), 400
     try:
-        r = SESSION.get(url, timeout=15, allow_redirects=True)
-        soup = BeautifulSoup(r.text, "lxml")
+        soup, raw_text = fetch(url)
         cms = detect_cms(soup, url)
-        sidearm_cards = len(soup.select(".s-person-card"))
-        tables = len(soup.find_all("table"))
+
+        # Run every selector and report counts
+        selector_hits = {}
+        for sel in [
+            ".s-person-card", "tr.rosterItem", "tr.odd", "tr.even",
+            "ul.roster-list li", ".roster_item", "[class*='rosterItem']",
+            "a[href*='/roster/']", ".roster_name", ".full-name",
+            "table tbody tr",
+        ]:
+            try:
+                hits = soup.select(sel)
+                if hits:
+                    selector_hits[sel] = len(hits)
+            except Exception:
+                pass
+
+        # Table inventory
+        table_info = []
+        for i, t in enumerate(soup.find_all("table")):
+            rows = t.find_all("tr")
+            header_cells = [clean(c.get_text()) for c in rows[0].find_all(["th","td"])] if rows else []
+            sample_row = [clean(c.get_text()) for c in rows[1].find_all(["th","td"])] if len(rows) > 1 else []
+            table_info.append({
+                "index": i,
+                "rows": len(rows),
+                "classes": t.get("class", []),
+                "id": t.get("id", ""),
+                "header": header_cells[:10],
+                "sample_row": sample_row[:10],
+            })
+
+        # Actually run the full scraper pipeline
+        players_sidearm  = scrape_sidearm(soup, url)
+        players_generic  = scrape_generic(soup, url) if not players_sidearm else []
+
         return jsonify({
-            "status_code": r.status_code,
-            "content_length": len(r.text),
+            "status_code": 200,
             "cms_detected": cms,
-            "sidearm_cards": sidearm_cards,
-            "tables": tables,
-            "first_500_chars": r.text[:500],
-            "response_headers": dict(r.headers),
+            "content_length": len(raw_text),
+            "selector_hits": selector_hits,
+            "tables": table_info,
+            "scraper_results": {
+                "sidearm": len(players_sidearm),
+                "generic": len(players_generic),
+            },
+            "first_3_players": players_sidearm[:3] or players_generic[:3],
+            "first_500_chars": raw_text[:500],
         })
     except Exception as e:
         return jsonify({"error": str(e), "url": url}), 500
